@@ -29,20 +29,26 @@ export async function onRequest(context) {
     const url = new URL(request.url);
 
     // 验证鉴权（主函数调用）
-    const isValidAuth = await validateAuth(request, env);
-    if (!isValidAuth) {
-        return new Response(JSON.stringify({
-            success: false,
-            error: '代理访问未授权：请检查密码配置或鉴权参数'
-        }), { 
-            status: 401,
-            headers: {
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
-                'Access-Control-Allow-Headers': '*',
-                'Content-Type': 'application/json'
-            }
-        });
+    // 豆瓣图片请求跳过鉴权，因为 <img> 标签无法附加 auth 参数
+    const targetUrlPreview = getTargetUrlFromPath(url.pathname);
+    const isDoubanImage = targetUrlPreview && targetUrlPreview.match(/img\d*\.doubanio\.com/i);
+    
+    if (!isDoubanImage) {
+        const isValidAuth = await validateAuth(request, env);
+        if (!isValidAuth) {
+            return new Response(JSON.stringify({
+                success: false,
+                error: '代理访问未授权：请检查密码配置或鉴权参数'
+            }), { 
+                status: 401,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': '*',
+                    'Content-Type': 'application/json'
+                }
+            });
+        }
     }
 
     // --- 从环境变量读取配置 ---
@@ -116,8 +122,9 @@ export async function onRequest(context) {
         return true;
     }
 
-    // 验证鉴权（主函数调用）
-    if (!validateAuth(request, env)) {
+    // 验证鉴权（主函数调用）- 重复检查，豆瓣图片已在前方跳过
+    // 此处保留兼容旧版逻辑的二次检查
+    if (!isDoubanImage && !validateAuth(request, env)) {
         return new Response('Unauthorized', { 
             status: 401,
             headers: {
@@ -248,13 +255,19 @@ export async function onRequest(context) {
 
     // 获取远程内容及其类型
     async function fetchContentWithType(targetUrl) {
+        // 对豆瓣图片设置特殊 Referer
+        let referer = request.headers.get('Referer') || new URL(targetUrl).origin;
+        if (targetUrl.match(/img\d*\.doubanio\.com/i)) {
+            referer = 'https://movie.douban.com/';
+        }
+        
         const headers = new Headers({
             'User-Agent': getRandomUserAgent(),
             'Accept': '*/*',
             // 尝试传递一些原始请求的头信息
             'Accept-Language': request.headers.get('Accept-Language') || 'zh-CN,zh;q=0.9,en;q=0.8',
             // 尝试设置 Referer 为目标网站的域名，或者传递原始 Referer
-            'Referer': request.headers.get('Referer') || new URL(targetUrl).origin
+            'Referer': referer
         });
 
         try {
@@ -269,9 +282,16 @@ export async function onRequest(context) {
                  throw new Error(`HTTP error ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 150)}`);
             }
 
+            const contentType = response.headers.get('Content-Type') || '';
+            
+            // 对图片等二进制内容，直接返回 Response 对象（不做 text() 转换）
+            if (isMediaFile(targetUrl, contentType) && !contentType.includes('mpegurl') && !contentType.includes('x-mpegurl')) {
+                logDebug(`检测到图片/媒体文件，直接流式返回: ${targetUrl}, Content-Type: ${contentType}`);
+                return { isBinary: true, response, contentType, responseHeaders: response.headers };
+            }
+            
             // 读取响应内容为文本
             const content = await response.text();
-            const contentType = response.headers.get('Content-Type') || '';
             logDebug(`请求成功: ${targetUrl}, Content-Type: ${contentType}, 内容长度: ${content.length}`);
             return { content, contentType, responseHeaders: response.headers }; // 同时返回原始响应头
 
@@ -539,7 +559,23 @@ export async function onRequest(context) {
         }
 
         // --- 实际请求 ---
-        const { content, contentType, responseHeaders } = await fetchContentWithType(targetUrl);
+        const fetchResult = await fetchContentWithType(targetUrl);
+        
+        // 处理二进制媒体文件（图片等）- 直接流式返回
+        if (fetchResult.isBinary) {
+            logDebug(`直接流式返回二进制内容: ${targetUrl}`);
+            const finalHeaders = new Headers(fetchResult.responseHeaders);
+            finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
+            finalHeaders.set("Access-Control-Allow-Origin", "*");
+            finalHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
+            finalHeaders.set("Access-Control-Allow-Headers", "*");
+            return new Response(fetchResult.response.body, {
+                status: 200,
+                headers: finalHeaders
+            });
+        }
+        
+        const { content, contentType, responseHeaders } = fetchResult;
 
         // --- 写入缓存 (KV) ---
         if (kvNamespace) {
