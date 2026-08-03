@@ -183,5 +183,9 @@ function displayVersionElement(element) {
     }
 }
 
-// 页面加载完成后添加版本信息
-document.addEventListener('DOMContentLoaded', addVersionInfoToFooter);
+// 页面完全加载且空闲后再执行版本检查，不阻塞渲染
+window.addEventListener('load', function() {
+    // 使用 requestIdleCallback 在浏览器空闲时执行，降级到 setTimeout
+    const scheduleIdle = window.requestIdleCallback || function(cb) { setTimeout(cb, 2000); };
+    scheduleIdle(addVersionInfoToFooter);
+});
